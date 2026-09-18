@@ -63,7 +63,107 @@ def build_chain() -> Any:
     ``deepseek-v4-flash-vision-exp``. The API key is loaded from .env.
     """
     ### YOUR CODE HERE
-    return None
+    from langchain_core.output_parsers import StrOutputParser
+    from langchain_core.prompts import ChatPromptTemplate
+    from langchain_deepseek import ChatDeepSeek
+
+    model = ChatDeepSeek(
+        model="deepseek-v4-flash-vision-exp",
+        temperature=0,
+        max_tokens=None,
+        timeout=90,
+        max_retries=2,
+    )
+
+    extraction_prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                """You extract monetary fields from one supermarket receipt image.
+Read the receipt itself carefully, including English and Chinese labels. Return
+exactly one compact JSON object and nothing else: no Markdown, code fence, or
+explanation. Use monetary strings and this schema:
+{{"paid":"394.70","subtotal":"394.72","discounts":["10.00","5.48"]}}
+
+Definitions:
+- paid: the final amount payable after the ROUNDING adjustment.
+- subtotal: the SUBTOTAL/小计 amount before the ROUNDING adjustment, after
+  discounts have already been applied.
+- discounts: every genuine discount line as a positive absolute amount, even
+  when the receipt prints it with a minus sign.
+
+Every monetary string must have exactly two decimal places. Read each discount
+amount actually printed on the receipt; never calculate an amount from a printed
+discount percentage. If there are no discounts, discounts must be [].
+
+Discounts include Buy N Save promotions, percentage OFF reductions, coupons,
+member discounts, App Upgrade discounts, and discounts for damaged, broken,
+or deformed packaging. Exclude ROUNDING, change/找续, cash tendered, card
+balance, loyalty points, and duplicate bank-card transaction records. Do not
+mistake payment/tender or repeated card slips for purchases or discounts.
+Preserve cents exactly as printed and include each genuine discount once.""",
+            ),
+            (
+                "human",
+                [
+                    {
+                        "type": "text",
+                        "text": "Extract paid, subtotal, and discounts from this single receipt.",
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "{image_url}"},
+                    },
+                ],
+            ),
+        ]
+    )
+
+    audit_prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                """You are the independent second-pass auditor for one supermarket
+receipt. Re-read the original image yourself, then check the first-pass draft.
+Correct every error or omission you find. Return exactly one compact JSON object
+and nothing else: no Markdown, code fence, or explanation. Use monetary strings
+and this schema:
+{{"paid":"394.70","subtotal":"394.72","discounts":["10.00","5.48"]}}
+
+The audited fields mean:
+- paid is the final payable amount after ROUNDING.
+- subtotal is SUBTOTAL/小计 before ROUNDING and after discounts.
+- discounts lists all genuine discount lines as positive absolute amounts.
+
+Every monetary string must have exactly two decimal places. Read each discount
+amount actually printed on the receipt; never calculate an amount from a printed
+discount percentage. If there are no discounts, discounts must be [].
+
+Count Buy N Save, percentage OFF, coupon, member, App Upgrade, and damaged,
+broken, or deformed-packaging discounts. Never count ROUNDING, change/找续,
+cash tendered, card balance, loyalty points, or duplicate bank-card transaction
+records. Check labels, signs, decimal places, duplicated lines, and arithmetic;
+prefer the original receipt over the draft whenever they disagree.""",
+            ),
+            (
+                "human",
+                [
+                    {
+                        "type": "text",
+                        "text": "First-pass draft:\n{draft}\nAudit it against the receipt image.",
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "{image_url}"},
+                    },
+                ],
+            ),
+        ]
+    )
+
+    extract_chain = extraction_prompt | model | StrOutputParser()
+    audit_chain = audit_prompt | model | StrOutputParser()
+    return {"extract": extract_chain, "audit": audit_chain}
 
 
 def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
@@ -79,8 +179,153 @@ def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
     to process independent receipt-extraction prompts in parallel.
     """
     ### YOUR CODE HERE
-    _ = (chain, images)
-    return {QUERY_1: DUMMY_RESPONSE, QUERY_2: DUMMY_RESPONSE}
+    def parse_amount(value: Any, field_name: str) -> Decimal:
+        if isinstance(value, bool):
+            raise ValueError(f"{field_name} must be a monetary value")
+
+        if isinstance(value, Decimal):
+            amount = value
+        elif isinstance(value, (str, int)):
+            cleaned = str(value).strip().replace("−", "-")
+            cleaned = re.sub(r"HK\$", "", cleaned, flags=re.IGNORECASE)
+            cleaned = cleaned.replace("$", "").replace(",", "").strip()
+            try:
+                amount = Decimal(cleaned)
+            except InvalidOperation as exc:
+                raise ValueError(
+                    f"{field_name} is not a valid monetary value: {value!r}"
+                ) from exc
+        else:
+            raise ValueError(f"{field_name} has unsupported type {type(value).__name__}")
+
+        if not amount.is_finite():
+            raise ValueError(f"{field_name} must be finite")
+        try:
+            return amount.quantize(Decimal("0.01"))
+        except InvalidOperation as exc:
+            raise ValueError(f"{field_name} cannot be rounded to cents") from exc
+
+    def parse_receipt_output(value: Any) -> tuple[Decimal, Decimal]:
+        if isinstance(value, BaseException):
+            raise ValueError(
+                f"model call failed with {type(value).__name__}: {value}"
+            )
+
+        text = response_text(value)
+        match = re.search(r"\{.*?\}", text, flags=re.DOTALL)
+        if match is None:
+            raise ValueError("response does not contain a JSON object")
+
+        try:
+            data = json.loads(
+                match.group(0),
+                parse_float=Decimal,
+                parse_int=Decimal,
+            )
+        except (json.JSONDecodeError, InvalidOperation) as exc:
+            raise ValueError(f"invalid JSON object: {exc}") from exc
+
+        if not isinstance(data, dict):
+            raise ValueError("JSON value must be an object")
+        if "paid" not in data or "subtotal" not in data:
+            raise ValueError("JSON object must contain paid and subtotal")
+
+        discounts = data.get("discounts", [])
+        if not isinstance(discounts, list):
+            raise ValueError("discounts must be a list")
+
+        paid = parse_amount(data["paid"], "paid")
+        subtotal = parse_amount(data["subtotal"], "subtotal")
+        discount_total = sum(
+            (abs(parse_amount(item, f"discounts[{index}]"))
+             for index, item in enumerate(discounts)),
+            Decimal("0.00"),
+        )
+
+        if abs(paid - subtotal) > Decimal("0.50"):
+            raise ValueError(
+                f"paid {paid:.2f} and subtotal {subtotal:.2f} differ by more than 0.50"
+            )
+
+        without_discount = (subtotal + discount_total).quantize(Decimal("0.01"))
+        return paid, without_discount
+
+    image_inputs = [
+        {"image_url": image_data_url(image)}
+        for image in images
+    ]
+    batch_config = {"max_concurrency": 4}
+
+    extract_outputs = chain["extract"].batch(
+        image_inputs,
+        config=batch_config,
+        return_exceptions=True,
+    )
+
+    audit_inputs = []
+    for image_input, extract_output in zip(image_inputs, extract_outputs):
+        if isinstance(extract_output, BaseException):
+            draft = (
+                "The first extraction pass failed. Independently extract all "
+                "required fields from the receipt image."
+            )
+        else:
+            draft = response_text(extract_output)
+        audit_inputs.append(
+            {
+                "image_url": image_input["image_url"],
+                "draft": draft,
+            }
+        )
+
+    audit_outputs = chain["audit"].batch(
+        audit_inputs,
+        config=batch_config,
+        return_exceptions=True,
+    )
+
+    total_paid = Decimal("0.00")
+    total_without_discount = Decimal("0.00")
+
+    for index, (image, image_input) in enumerate(zip(images, image_inputs)):
+        errors = []
+        selected = None
+
+        candidates = (
+            ("audit", audit_outputs[index]),
+            ("extract", extract_outputs[index]),
+        )
+        for label, candidate in candidates:
+            try:
+                selected = parse_receipt_output(candidate)
+                break
+            except Exception as exc:
+                errors.append(f"{label}: {type(exc).__name__}: {exc}")
+
+        if selected is None:
+            try:
+                retry_output = chain["extract"].invoke(image_input)
+                selected = parse_receipt_output(retry_output)
+            except Exception as exc:
+                errors.append(f"retry: {type(exc).__name__}: {exc}")
+
+        if selected is None:
+            print(
+                f"Warning: {image.name}: receipt extraction failed; "
+                + "; ".join(errors)
+            )
+            selected = (Decimal("0.00"), Decimal("0.00"))
+
+        paid, without_discount = selected
+        total_paid += paid
+        total_without_discount += without_discount
+
+    total_paid = total_paid.quantize(Decimal("0.01"))
+    total_without_discount = total_without_discount.quantize(Decimal("0.01"))
+    return {
+        QUERY_1: f"HK${total_paid:.2f}",
+        QUERY_2: f"HK${total_without_discount:.2f}",
+    }
 
 
 # Everything below is provided runner/scoring code. No edits are needed.

@@ -49,5 +49,49 @@ homework runner.
 
 
 ## Homework 1 solution: 
-> to students: please fill your solution description here.
+
+### Pipeline design
+
+```mermaid
+flowchart TD
+    A[Receipt images] --> B[Convert to data URLs]
+    B --> C[First-pass extraction batch]
+    C --> D[Second-pass audit batch]
+    D --> E{Audited JSON valid?}
+    E -->|Yes| H[Validate with Decimal]
+    E -->|No| F{First-pass JSON valid?}
+    F -->|Yes| H
+    F -->|No| G[Retry extraction once]
+    G --> H
+    H --> I[Calculate per-receipt amounts]
+    I --> J[Aggregate all receipts]
+    J --> K[Return two HKD answers]
+```
+
+### Solution description
+
+The solution uses a two-pass multimodal LangChain pipeline. `build_chain()`
+creates one `ChatDeepSeek` model using
+`deepseek-v4-flash-vision-exp` and connects it to two
+`ChatPromptTemplate` pipelines. The extraction pipeline reads each receipt
+image and returns a compact JSON object containing `paid`, `subtotal`, and
+`discounts`. The audit pipeline receives both the original image and the
+first-pass draft, re-reads the receipt independently, and corrects missing,
+duplicated, or misclassified monetary entries.
+
+`answer_queries()` converts every local image to a data URL and processes the
+receipts in parallel with a maximum concurrency of four. The audited response
+is preferred, while the first-pass response and one independent retry provide
+fallbacks when an output is invalid. Model responses are parsed as JSON and
+all monetary values are converted to `Decimal`, avoiding binary floating-point
+rounding errors. The parser also checks that `paid` and `subtotal` differ by no
+more than HK$0.50, since their difference should only be the receipt's rounding
+adjustment.
+
+For each receipt, the amount spent is the final `paid` value. The amount
+without discounts is computed deterministically as `subtotal + sum(discounts)`.
+Discount values are converted to positive magnitudes, while rounding, change,
+cash tendered, card balances, loyalty points, and duplicated payment records
+are excluded by the prompts. Finally, the per-receipt values are summed and
+returned as two strings containing exactly one HKD amount each.
 
